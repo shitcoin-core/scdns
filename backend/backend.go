@@ -159,7 +159,7 @@ func (tx *btx) Do() (rrs []dns.RR, err error) {
 }
 
 func (tx *btx) determineDomain() (subname, basename, rootname string, err error) {
-	return util.SplitDomainByFloatingAnchor(tx.qname, "bit")
+	return util.SplitDomainByFloatingAnchor(tx.qname, "shit")
 }
 
 func (tx *btx) doRootDomain() (rrs []dns.RR, err error) {
