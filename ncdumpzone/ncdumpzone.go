@@ -8,16 +8,17 @@ import (
 	"github.com/hlandau/xlog"
 	"github.com/miekg/dns"
 
-	extratypes "github.com/hlandau/ncbtcjsontypes"
+	"github.com/namecoin/ncbtcjson"
 	"github.com/namecoin/ncdns/namecoin"
 	"github.com/namecoin/ncdns/ncdomain"
+	"github.com/namecoin/ncdns/rrtourl"
 	"github.com/namecoin/ncdns/tlsoverridefirefox"
 	"github.com/namecoin/ncdns/util"
 )
 
 var log, Log = xlog.New("ncdumpzone")
 
-const perCall = 1000
+const defaultPerCall uint32 = 1000
 
 func dumpRR(rr dns.RR, dest io.Writer, format string) error {
 	switch format {
@@ -29,12 +30,18 @@ func dumpRR(rr dns.RR, dest io.Writer, format string) error {
 			return err
 		}
 		fmt.Fprint(dest, result)
+	case "url-list":
+		result, err := rrtourl.URLsFromRR(rr)
+		if err != nil {
+			return err
+		}
+		fmt.Fprint(dest, result)
 	}
 
 	return nil
 }
 
-func dumpName(item *extratypes.NameFilterItem, conn namecoin.Conn,
+func dumpName(item *ncbtcjson.NameShowResult, conn *namecoin.Client,
 	dest io.Writer, format string) error {
 	// The order in which name_scan returns results is seemingly rather
 	// random, so we can't stop when we see a non-d/ name, so just skip it.
@@ -48,7 +55,7 @@ func dumpName(item *extratypes.NameFilterItem, conn namecoin.Conn,
 	}
 
 	getNameFunc := func(k string) (string, error) {
-		return conn.Query(k)
+		return conn.NameQuery(k, "")
 	}
 
 	var errors []error
@@ -76,16 +83,18 @@ func dumpName(item *extratypes.NameFilterItem, conn namecoin.Conn,
 
 // Dump extracts all domain names from conn, formats them according to the
 // specified format, and writes the result to dest.
-func Dump(conn namecoin.Conn, dest io.Writer, format string) error {
-	if format != "zonefile" && format != "firefox-override" {
+func Dump(conn *namecoin.Client, dest io.Writer, format string) error {
+	if format != "zonefile" && format != "firefox-override" &&
+		format != "url-list" {
 		return fmt.Errorf("Invalid \"format\" argument: %s", format)
 	}
 
 	currentName := "d/"
 	continuing := 0
+	perCall := defaultPerCall
 
 	for {
-		results, err := conn.Scan(currentName, perCall)
+		results, err := conn.NameScan(currentName, perCall)
 		if err != nil {
 			return fmt.Errorf("scan: %s", err)
 		}
@@ -100,6 +109,33 @@ func Dump(conn namecoin.Conn, dest io.Writer, format string) error {
 			results = results[1:]
 		} else {
 			continuing = 1
+		}
+
+		// Temporary hack to fix
+		// https://github.com/namecoin/ncdns/issues/105
+		// TODO: Replace this hack with hex encoding after Namecoin
+		// Core 0.18.0+ is ubiquitous.
+		lenResults := len(results)
+		for results[len(results)-1].NameError != "" {
+			results = results[:len(results)-1]
+
+			if len(results) == 0 {
+				break
+			}
+		}
+		// Edge case: if all of the results had a NameError,
+		// then try to get more results at once.
+		if len(results) == 0 {
+			// All of the results had a nameError but we're
+			// at the end of the results, so not a problem.
+			if lenResults < int(perCall)-1 {
+				log.Info("out of results, stopping")
+				break
+			}
+
+			log.Warnf("All %d results (start point %s) had a NameError", lenResults, currentName)
+			perCall *= 2
+			continue
 		}
 
 		for i := range results {

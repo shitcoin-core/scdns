@@ -12,10 +12,10 @@ import (
 	"github.com/hlandau/buildinfo"
 	"github.com/hlandau/xlog"
 	"github.com/miekg/dns"
+	"github.com/namecoin/btcd/rpcclient"
 	"github.com/namecoin/ncdns/backend"
 	"github.com/namecoin/ncdns/namecoin"
-	"github.com/namecoin/ncdns/tlsoverridefirefox/tlsoverridefirefoxsync"
-	"gopkg.in/hlandau/madns.v1"
+	madns "gopkg.in/hlandau/madns.v2"
 )
 
 var log, Log = xlog.New("ncdns.server")
@@ -24,7 +24,7 @@ type Server struct {
 	cfg Config
 
 	engine       madns.Engine
-	namecoinConn namecoin.Conn
+	namecoinConn *namecoin.Client
 
 	mux         *dns.ServeMux
 	udpServer   *dns.Server
@@ -44,7 +44,8 @@ type Config struct {
 	NamecoinRPCUsername   string `default:"" usage:"Namecoin RPC username"`
 	NamecoinRPCPassword   string `default:"" usage:"Namecoin RPC password"`
 	NamecoinRPCAddress    string `default:"127.0.0.1:8336" usage:"Namecoin RPC server address"`
-	NamecoinRPCCookiePath string `default:"" usage:"Namecoin RPC cookie path (if set, used instead of password)"`
+	NamecoinRPCCookiePath string `default:"" usage:"Namecoin RPC cookie path (used if password is unspecified)"`
+	NamecoinRPCTimeout    int    `default:"1500" usage:"Timeout (in milliseconds) for Namecoin RPC requests"`
 	CacheMaxEntries       int    `default:"100" usage:"Maximum name cache entries"`
 	SelfName              string `default:"" usage:"The FQDN of this nameserver. If empty, a pseudo-hostname is generated."`
 	SelfIP                string `default:"127.127.127.127" usage:"The canonical IP address for this service"`
@@ -72,17 +73,26 @@ var ncdnsVersion string
 func New(cfg *Config) (s *Server, err error) {
 	ncdnsVersion = buildinfo.VersionSummary("github.com/namecoin/ncdns", "ncdns")
 
-	s = &Server{
-		cfg: *cfg,
-		namecoinConn: namecoin.Conn{
-			Username: cfg.NamecoinRPCUsername,
-			Password: cfg.NamecoinRPCPassword,
-			Server:   cfg.NamecoinRPCAddress,
-		},
+	// Connect to local namecoin core RPC server using HTTP POST mode.
+	connCfg := &rpcclient.ConnConfig{
+		Host:         cfg.NamecoinRPCAddress,
+		User:         cfg.NamecoinRPCUsername,
+		Pass:         cfg.NamecoinRPCPassword,
+		CookiePath:   cfg.NamecoinRPCCookiePath,
+		HTTPPostMode: true, // Namecoin core only supports HTTP POST mode
+		DisableTLS:   true, // Namecoin core does not provide TLS by default
 	}
 
-	if s.cfg.NamecoinRPCCookiePath != "" {
-		s.namecoinConn.GetAuth = cookieRetriever(s.cfg.NamecoinRPCCookiePath)
+	// Notice the notification parameter is nil since notifications are
+	// not supported in HTTP POST mode.
+	client, err := namecoin.New(connCfg, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	s = &Server{
+		cfg:          *cfg,
+		namecoinConn: client,
 	}
 
 	if s.cfg.CanonicalNameservers != "" {
@@ -105,6 +115,7 @@ func New(cfg *Config) (s *Server, err error) {
 
 	b, err := backend.New(&backend.Config{
 		NamecoinConn:         s.namecoinConn,
+		NamecoinTimeout:      cfg.NamecoinRPCTimeout,
 		CacheMaxEntries:      cfg.CacheMaxEntries,
 		SelfIP:               cfg.SelfIP,
 		Hostmaster:           cfg.Hostmaster,
@@ -215,12 +226,7 @@ func (s *Server) Start() error {
 	s.wgStart.Wait()
 	log.Info("Listeners started")
 
-	err := tlsoverridefirefoxsync.Start(s.namecoinConn, s.cfg.CanonicalSuffix)
-	if err != nil {
-		return fmt.Errorf("Couldn't start Firefox override sync: %s", err)
-	}
-
-	return nil
+	return s.StartBackgroundTasks()
 }
 
 func (s *Server) doRunListener(ds *dns.Server) {
